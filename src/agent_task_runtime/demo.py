@@ -120,7 +120,7 @@ def run_demo(out: Callable[[str], None] = print, db_path: str | Path | None = No
             say(
                 "reaper",
                 f"lease expired -> {task.id} back to '{task.state.value}' "
-                f"(attempts used: {task.attempt}/{task.max_attempts})",
+                f"(attempts used: {task.attempts_used}/{task.max_attempts})",
             )
 
         # 4. worker B takes over and resumes ---------------------------------

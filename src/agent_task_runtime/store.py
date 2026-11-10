@@ -25,6 +25,7 @@ from typing import Any
 
 from .clock import Clock, SystemClock
 from .errors import (
+    DuplicateTaskIdError,
     IdempotencyConflictError,
     LeaseExpiredError,
     StaleLeaseError,
@@ -66,6 +67,8 @@ def _task_from_row(row: sqlite3.Row) -> Task:
         result=json.loads(row["result"]) if row["result"] is not None else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        lease_seconds=row["lease_seconds"],
+        releases=row["releases"],
     )
 
 
@@ -239,6 +242,11 @@ class TaskStore:
                         )
                     return EnqueueResult(existing, created=False)
             new_id = task_id or uuid.uuid4().hex
+            if (
+                task_id is not None
+                and conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            ):
+                raise DuplicateTaskIdError(f"task id already exists: {task_id}")
             conn.execute(
                 "INSERT INTO tasks (id, kind, payload, state, priority, idempotency_key,"
                 " max_attempts, not_before, created_at, updated_at)"
@@ -293,8 +301,8 @@ class TaskStore:
             token = task.attempt + 1
             conn.execute(
                 "UPDATE tasks SET state = 'leased', attempt = ?, lease_owner = ?,"
-                " lease_expires_at = ?, updated_at = ? WHERE id = ?",
-                (token, worker_id, now + duration, now, task.id),
+                " lease_expires_at = ?, lease_seconds = ?, updated_at = ? WHERE id = ?",
+                (token, worker_id, now + duration, duration, now, task.id),
             )
             self._log(
                 task.id,
@@ -311,11 +319,17 @@ class TaskStore:
     # ---------------------------------------------------------------- heartbeat
 
     def heartbeat(self, task_id: str, token: int, *, lease_seconds: float | None = None) -> Task:
-        """Renew a lease. Rejected for stale tokens and for already-expired leases."""
-        duration = lease_seconds if lease_seconds is not None else self.lease_seconds
+        """Renew a lease. Rejected for stale tokens and for already-expired leases.
+
+        Without ``lease_seconds`` the lease is renewed for the duration it was
+        claimed with, not the store default.
+        """
         with self._tx() as conn:
             now = self.clock.now()
             task = self._require_lease(task_id, token)
+            duration = lease_seconds
+            if duration is None:
+                duration = task.lease_seconds or self.lease_seconds
             if task.lease_expires_at is not None and task.lease_expires_at <= now:
                 raise LeaseExpiredError(
                     task_id,
@@ -408,7 +422,7 @@ class TaskStore:
             who = actor or task.lease_owner or SYSTEM_ACTOR
             if not retryable:
                 target, event_type = TaskState.FAILED, "failed"
-            elif task.attempt >= task.max_attempts:
+            elif task.attempts_used >= task.max_attempts:
                 target, event_type = TaskState.DEAD_LETTERED, "dead_lettered"
             else:
                 target, event_type = TaskState.QUEUED, "retry_scheduled"
@@ -416,7 +430,7 @@ class TaskStore:
             detail: dict[str, Any] = {"error": error, "retryable": retryable}
             not_before = task.not_before
             if target is TaskState.QUEUED:
-                delay = self.retry_policy.delay(task.attempt, self.rng)
+                delay = self.retry_policy.delay(task.attempts_used, self.rng)
                 not_before = now + delay
                 detail["delay_seconds"] = delay
                 detail["not_before"] = not_before
@@ -434,8 +448,11 @@ class TaskStore:
     def release(self, task_id: str, token: int, reason: str, *, actor: str | None = None) -> Task:
         """Hand a leased task back to the queue immediately, without backoff.
 
-        Used for graceful shutdown. The attempt already counts toward
-        ``max_attempts`` because the attempt number is the fencing token.
+        Used for graceful shutdown. The fencing token still advances on the
+        next claim (``attempt`` counts every claim), but a release does not
+        consume retry budget: ``releases`` is incremented and
+        :attr:`Task.attempts_used` subtracts it, so ``max_attempts`` keeps
+        meaning "failed or lost attempts" and a restart cannot dead-letter work.
         """
         with self._tx() as conn:
             now = self.clock.now()
@@ -443,7 +460,7 @@ class TaskStore:
             check_transition(task_id, task.state, TaskState.QUEUED)
             conn.execute(
                 "UPDATE tasks SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL,"
-                " updated_at = ? WHERE id = ?",
+                " releases = releases + 1, updated_at = ? WHERE id = ?",
                 (now, task_id),
             )
             self._log(
@@ -501,7 +518,7 @@ class TaskStore:
             ).fetchall()
             for row in rows:
                 task = _task_from_row(row)
-                exhausted = task.attempt >= task.max_attempts
+                exhausted = task.attempts_used >= task.max_attempts
                 target = TaskState.DEAD_LETTERED if exhausted else TaskState.QUEUED
                 check_transition(task.id, task.state, target)
                 message = f"lease held by {task.lease_owner} expired at {task.lease_expires_at}"

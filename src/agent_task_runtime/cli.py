@@ -6,6 +6,7 @@ import argparse
 import json
 import signal
 import sys
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -126,7 +127,8 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             for task in store.list_tasks():
                 print(
                     f"{task.id}  {task.state.value:<13} kind={task.kind} "
-                    f"prio={task.priority} attempt={task.attempt}/{task.max_attempts}"
+                    f"prio={task.priority} attempt={task.attempt} "
+                    f"used={task.attempts_used}/{task.max_attempts}"
                 )
             return 0
         task = store.get_task(args.task_id)
@@ -136,6 +138,8 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             "state": task.state.value,
             "priority": task.priority,
             "attempt": task.attempt,
+            "attempts_used": task.attempts_used,
+            "releases": task.releases,
             "max_attempts": task.max_attempts,
             "not_before": task.not_before,
             "lease_owner": task.lease_owner,
@@ -194,8 +198,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             return 0
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, request_stop)
-        import time
-
         while not stop:
             report = dispatcher.run_once()
             if not report.delivered:

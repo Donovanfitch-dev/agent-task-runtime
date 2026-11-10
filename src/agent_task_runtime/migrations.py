@@ -101,6 +101,14 @@ MIGRATIONS: tuple[Migration, ...] = (
         CREATE INDEX idx_outbox_due ON outbox (status, next_attempt_at, id);
         """,
     ),
+    Migration(
+        4,
+        "lease_duration_and_release_count",
+        """
+        ALTER TABLE tasks ADD COLUMN lease_seconds REAL;
+        ALTER TABLE tasks ADD COLUMN releases INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 )
 
 

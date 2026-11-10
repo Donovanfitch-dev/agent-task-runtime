@@ -7,6 +7,7 @@ demonstration; not extracted from any production system.
 from .clock import Clock, ManualClock, SystemClock
 from .errors import (
     AgentTaskRuntimeError,
+    DuplicateTaskIdError,
     IdempotencyConflictError,
     IllegalTransitionError,
     LeaseExpiredError,
@@ -26,7 +27,7 @@ from .executors import (
 )
 from .models import EnqueueResult, OutboxEvent, Task, TaskEvent, TaskState
 from .outbox import OutboxDispatcher
-from .retry import RetryPolicy
+from .retry import Backoff, RetryPolicy
 from .sinks import DedupSink, FlakySink, ListSink, LostAckSink, Sink
 from .store import TaskStore
 from .worker import Executor, RunResult, TaskContext, Worker
@@ -36,8 +37,10 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentTaskRuntimeError",
     "AlwaysFailingExecutor",
+    "Backoff",
     "Clock",
     "DedupSink",
+    "DuplicateTaskIdError",
     "EnqueueResult",
     "Executor",
     "FlakyExecutor",

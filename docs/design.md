@@ -24,7 +24,7 @@ the way it is. For *what* it guarantees, see the README.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `tasks` | `seq` (autoincrement), `id`, `state`, `priority`, `attempt`, `max_attempts`, `not_before`, `lease_owner`, `lease_expires_at`, `idempotency_key` (unique) | `seq` gives FIFO order; `attempt` is the fencing token |
+| `tasks` | `seq` (autoincrement), `id`, `state`, `priority`, `attempt`, `releases`, `max_attempts`, `not_before`, `lease_owner`, `lease_expires_at`, `lease_seconds`, `idempotency_key` (unique) | `seq` gives FIFO order; `attempt` is the fencing token (it counts every claim); `attempt - releases` is the retry budget used; `lease_seconds` is the claimed duration that heartbeats renew with |
 | `task_events` | `task_id`, `at`, `actor`, `event_type`, `from_state`, `to_state`, `attempt`, `detail` | Append-only, enforced by triggers |
 | `checkpoints` | `(task_id, step)` primary key, `attempt`, `data` | One row per step, upserted |
 | `outbox` | `idempotency_key` (unique), `status`, `attempts`, `next_attempt_at` | Written in the same transaction as the terminal transition |
@@ -101,6 +101,19 @@ systems before it next touches the store. To protect an external system, pass
   (a subclass of `StaleLeaseError`): the worker has been told, in effect, to stop, and
   silently resurrecting a lapsed lease would make deadlines meaningless. The two behaviours
   are deliberately different and both are tested.
+* **Checkpoints follow the `complete` rule, not the heartbeat rule.** A checkpoint records
+  finished work and does not extend ownership, so it is accepted while the token is current
+  even past the deadline (and tested). Once the task is reclaimed the token is stale and the
+  checkpoint is rejected. The rule of thumb: operations that record finished work are
+  accepted for a current token; operations that extend ownership are not.
+* **Heartbeats renew with the claim's duration.** The duration is stored on the task at
+  claim time (`lease_seconds`) and `TaskContext` keeps it too, so a task claimed with a long
+  lease keeps it. Only an explicit `lease_seconds` argument changes it.
+* **Graceful release advances the token but not the budget.** `attempt` must keep rising
+  (it is the token), so a release increments `releases`; `max_attempts` bounds
+  `attempt - releases`, i.e. failed or lost attempts. The alternative, charging releases to
+  the budget, would let a rolling restart dead-letter healthy work. The cost is that a task
+  released forever is never stopped by the cap.
 * **Rejected operations write nothing, not even an audit row.** The tests snapshot the task,
   its events, its checkpoints and its outbox, attempt the stale call, and compare.
 * **Cancelling a leased task** moves it to `cancelled`; the worker's token is then stale
@@ -109,7 +122,7 @@ systems before it next touches the store. To protect an external system, pass
 ## 5. The reaper
 
 `reap_expired()` finds `leased` tasks whose deadline is `<=` now. For each it either
-re-queues the task, or, if `attempt >= max_attempts`, dead-letters it (and writes the outbox
+re-queues the task, or, if the retry budget (`attempt - releases`) is used up, dead-letters it (and writes the outbox
 event). It is idempotent, so any number of workers can run it, and `Worker.run_once` calls it
 before each claim by default.
 
@@ -125,11 +138,16 @@ raw   = min(max_delay, base_delay * multiplier ** (attempt - 1))
 delay = raw * (1 - jitter * u),   u in [0, 1) from the injected RNG
 ```
 
+The exponentiation saturates at `max_delay` for any attempt number (an `OverflowError` from the
+float power is caught and treated as the cap), so an event with a huge attempt count cannot
+break delivery. The backoff exponent for task retries is the budget used, not the claim count.
+
 Jitter only *shortens* the delay, so `max_delay` stays a true bound and the schedule for a
 given RNG stream is reproducible. The default `RetryPolicy` is 5 attempts, 1 s base, factor 2,
 60 s cap, jitter 0.5; these are illustrative defaults, not tuned values.
 
-The same policy class (with different parameters) backs outbox delivery backoff.
+The backoff part is a separate class, `Backoff`, with no attempt limit; `RetryPolicy` adds
+`max_attempts` on top, and outbox delivery uses a bare `Backoff` because delivery has no limit.
 
 Failure classification is the executor's job: `PermanentError` fails the task without retry,
 `ShutdownRequested` releases it, and every other exception is retried. Unknown exceptions
@@ -176,8 +194,18 @@ Failure windows, and what happens in each:
 The last two rows are why delivery is **at-least-once**: it is impossible for the dispatcher to
 distinguish "applied, ack lost" from "never applied". The cure is on the consumer side. Every
 event has a stable key (`<task_id>:<event_type>`), and `DedupSink` demonstrates an idempotent
-receiver that records processed keys in its own database inside the same transaction as the
-handler, so a failed handler leaves no key and a repeat is absorbed.
+receiver that records processed keys in its own database. It has two modes. In
+`transactional=True` mode the handler receives the sink's connection, so an effect written to
+that database commits or rolls back with the key: a crash between effect and commit leaves
+neither, and redelivery applies the effect once (tested). In the default mode the handler
+runs inside the transaction but its effect is outside it; a crash after an external effect
+repeats the effect on redelivery (also tested). Only the first mode is effectively-once, and
+only for effects stored in that same database.
+
+The dispatcher isolates events from each other: a sink failure or a bookkeeping error for
+one event is recorded (`DispatchReport.failed` / `.errors`) and the batch continues. It does
+not coordinate with other dispatchers: outbox rows are not claimed, so two dispatchers on
+one database can send the same row. That is allowed by at-least-once but is not designed for.
 
 Terminal outbox events: `task.succeeded`, `task.failed`, `task.dead_lettered`,
 `task.cancelled`. Retries and re-queues are not terminal and emit none. Because a task
@@ -215,7 +243,7 @@ database server's clock for lease deadlines.
 
 ```text
 claim -> build TaskContext (task, checkpoints) -> executor.execute(ctx)
-      -> complete(result)                  on return
+      -> complete(result)                  on return (unserialisable result: fail permanently)
       -> fail(retryable=False)             on PermanentError
       -> release                           on ShutdownRequested
       -> fail(retryable=True)              on any other Exception
@@ -226,6 +254,11 @@ claim -> build TaskContext (task, checkpoints) -> executor.execute(ctx)
 a simulated crash propagates out leaving the task `leased`, exactly as a killed process would.
 The demo and the checkpoint tests rely on this to model a hard crash without spawning
 processes.
+
+Errors from recording the result are the runtime's, not the executor's. A result that cannot
+be serialised (`TypeError`/`ValueError` from `complete`) fails the task permanently with
+`ResultNotRecordable`, because a retry would re-run the executor's side effects only to fail
+the same way. Any other store error propagates and leaves the task leased for the reaper.
 
 Graceful shutdown is cooperative: `Worker.stop()` sets an event; the loop finishes (or the
 executor releases, via `ctx.raise_if_stopping()`) the current task and does not claim another.
@@ -266,7 +299,9 @@ None of this is implemented; the table is a map, not a promise.
 ## 15. Known gaps
 
 * No background heartbeat, so a single blocking call longer than the lease will lose it.
-* Graceful release consumes an attempt (token and attempt count are one counter).
+* A task that is released repeatedly is never stopped by `max_attempts` (see section 4).
+* Crash-safety rests on SQLite and is tested with threads and close/reopen, not by killing
+  processes or cutting power.
 * No retention policy; `task_events`, `checkpoints` and delivered outbox rows grow forever.
 * No per-kind concurrency limits, rate limiting, dependencies between tasks, or scheduled
   (cron-like) enqueue. `not_before` provides delayed start only.

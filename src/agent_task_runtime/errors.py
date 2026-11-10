@@ -48,6 +48,10 @@ class LeaseExpiredError(StaleLeaseError):
     """The token is still current, but the lease deadline has passed (heartbeat only)."""
 
 
+class DuplicateTaskIdError(AgentTaskRuntimeError):
+    """An explicit task id was supplied that already exists."""
+
+
 class IdempotencyConflictError(AgentTaskRuntimeError):
     """An idempotency key was reused with a different kind or payload."""
 

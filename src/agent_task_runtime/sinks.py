@@ -37,21 +37,34 @@ class ListSink:
 
 
 class DedupSink:
-    """Wraps a handler so that each idempotency key is applied at most once.
+    """Applies each idempotency key at most once, recording keys in its own SQLite file.
 
-    Processed keys live in the sink's *own* SQLite database. The handler runs
-    and the key is recorded inside one transaction, so a handler that raises
-    leaves no key behind and the event can be retried; a repeated key is
-    acknowledged without re-running the handler. This is the consumer half of
-    "effectively-once": at-least-once delivery plus an idempotent receiver.
+    Two modes, with different guarantees:
 
-    Limit: if the handler's side effect lives outside this database (an HTTP
-    call, say), a crash between the effect and the commit can still repeat the
-    effect. True atomicity needs the effect and the key in one store.
+    * ``transactional=False`` (default): ``handler(event)`` is called, then the
+      key is recorded, inside one transaction. A handler that raises leaves no
+      key, so the event is retried; a repeated key is acknowledged without
+      re-running the handler. But the handler's *effect* is outside that
+      transaction. If the process dies after the effect and before the commit,
+      the effect happens again on redelivery. This mode narrows duplicates; it
+      does not make an external effect effectively-once.
+    * ``transactional=True``: ``handler(event, conn)`` receives this sink's
+      connection while the transaction is open, so a handler that writes its
+      effect to the same database commits the effect and the key atomically.
+      A crash or error before commit rolls back both, and redelivery applies
+      the effect exactly once. This is the effectively-once pattern, and it
+      only holds for effects stored in that same database.
     """
 
-    def __init__(self, handler: Callable[[OutboxEvent], None], db_path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        handler: Callable[..., None],
+        db_path: str = ":memory:",
+        *,
+        transactional: bool = False,
+    ) -> None:
         self._handler = handler
+        self._transactional = transactional
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.execute("CREATE TABLE IF NOT EXISTS processed (key TEXT PRIMARY KEY)")
         self.duplicates_ignored = 0
@@ -65,7 +78,10 @@ class DedupSink:
             if seen:
                 self.duplicates_ignored += 1
             else:
-                self._handler(event)
+                if self._transactional:
+                    self._handler(event, self._conn)
+                else:
+                    self._handler(event)
                 self._conn.execute(
                     "INSERT INTO processed (key) VALUES (?)", (event.idempotency_key,)
                 )

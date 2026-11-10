@@ -5,9 +5,8 @@ dependency-free Python package on top of SQLite.
 
 > **An independent reference implementation, written from scratch for demonstration; not
 > extracted from any production system.** All names and data in this repository are
-> fictional. Built with AI coding assistance (Claude Code). Nothing here has been benchmarked or run in
-> production, and no performance
-> or scale claims are made.
+> fictional. Implemented with AI coding agents (Claude Code). Nothing here has been
+> benchmarked or run in production, and no performance or scale claims are made.
 
 ## The problem
 
@@ -51,7 +50,7 @@ using this library:
 
 1. **Exclusive claims.** A task has at most one current fencing token, and a claim hands out
    each task attempt to exactly one claimer, even with many concurrent claimers (tested with
-   threads on separate connections).
+   threads on separate connections in one process; there is no multi-process test).
 2. **Atomic transitions.** A state change, its audit-log row and, for terminal states, its
    outbox row are written in one transaction, or not at all.
 3. **Fencing.** `complete`, `fail`, `heartbeat`, `save_checkpoint` and `release` with a
@@ -60,10 +59,14 @@ using this library:
 4. **Terminal states are final.** The transition table is enforced on every write; illegal
    transitions raise `IllegalTransitionError`.
 5. **Durability of committed work.** Committed state survives a process crash or restart
-   (WAL mode, `synchronous=FULL`), assuming the OS and disk honour `fsync`.
+   (WAL mode, `synchronous=FULL`), assuming the OS and disk honour `fsync`. This rests on
+   SQLite's transactional guarantees. The tests exercise it with threads and by closing and
+   reopening the database file; no test kills a process mid-transaction or simulates power
+   loss, and the demo's "crash" is an exception that bypasses the worker's error handling.
 6. **At-least-once outbox delivery.** An event committed with a terminal state is delivered
    at least once as long as a dispatcher keeps running; a row is marked delivered only after
-   the sink returns.
+   the sink returns. One failing event, or bad bookkeeping for one event, never stops the
+   rest of a dispatch batch.
 7. **Idempotent enqueue.** One key, one task. Reusing a key with a different kind or payload
    raises `IdempotencyConflictError` instead of silently returning the wrong task.
 
@@ -78,6 +81,9 @@ using this library:
 * **A zombie keeps running until it touches the store.** Fencing detects a stale owner at
   its next fenced write, not before.
 * **No ordering guarantee for outbox delivery** once any delivery has failed and been retried.
+* **Two concurrent dispatchers can deliver the same event.** Nothing claims outbox rows, so
+  two dispatchers on one database may both send a row. That is permitted by at-least-once
+  delivery but it is not designed for or tested; run one dispatcher, and make sinks idempotent.
 * **Not distributed.** One file, one host. Network filesystems are not supported. Lease
   expiry compares wall-clock timestamps, so all processes must share a clock; a clock step
   can expire leases early or late.
@@ -101,13 +107,13 @@ flowchart LR
     Dispatcher -->|deliver| Sink[Sink]
 ```
 
-Everything that matters lives in one module, `store.py`. Each public method is a single
-`BEGIN IMMEDIATE` transaction, so SQLite's single-writer lock is the serialisation
-mechanism. Tables:
+Everything that matters lives in one module, `store.py`. Each mutating method is a single
+`BEGIN IMMEDIATE` transaction (reads are plain queries), so SQLite's single-writer lock is
+the serialisation mechanism. Tables:
 
 | Table | Purpose |
 |---|---|
-| `tasks` | Current state, priority, fencing token (`attempt`), lease owner and deadline |
+| `tasks` | Current state, priority, fencing token (`attempt`), release count, lease owner, deadline and claimed duration |
 | `task_events` | Append-only audit log; `UPDATE` and `DELETE` are blocked by triggers |
 | `checkpoints` | Latest output per `(task, step)` |
 | `outbox` | Events awaiting delivery, with `next_attempt_at` backoff state |
@@ -317,7 +323,7 @@ work, more zombies); too long and a crashed worker's task sits idle until the le
 out. The runtime does not pick a number for you: the default is 30 seconds purely as a
 placeholder. Executors renew the lease with `ctx.heartbeat()` between steps, so the lease
 only needs to cover the longest *single step*, not the whole job. Per-claim overrides are
-supported.
+supported, and heartbeats renew with the duration the task was claimed with.
 
 **Fencing tokens.** A lease alone is not safe: a paused process cannot know its lease
 lapsed. Every write is conditioned on the token being current, and the token is the claim
@@ -347,7 +353,9 @@ None of that is implemented here.
 | Append-only audit log | Implemented and tested |
 | Versioned migrations (run-once, rollback on failure, race-safe) | Implemented and tested |
 | Worker loop, `Executor` protocol, graceful shutdown | Implemented and tested |
-| `DedupSink` (effectively-once consumer example) | Implemented and tested; a demonstration, not a production consumer |
+| `DedupSink` transactional mode (handler effect and dedup key in one SQLite transaction) | Implemented and tested; effects must live in the sink's own database; a demonstration, not a production consumer |
+| `DedupSink` default mode (external handler effects) | Implemented and tested; narrows duplicates only, cannot make external effects effectively-once |
+| Running more than one outbox dispatcher safely | Not designed for; may double-send (see non-guarantees) |
 | Simulated executors and the deterministic demo | Implemented and tested; simulations only, no real agent or model calls |
 | CLI `demo`, `enqueue`, `stats`, `inspect`, `work --once`, `dispatch --once` | Implemented and tested |
 | CLI long-running `work` and `dispatch` loops with signal handling | Prototype: run once during the build (clean exit on `SIGTERM`), not covered by automated tests |
@@ -364,13 +372,28 @@ None of that is implemented here.
 * The lease clock is the caller's wall clock (`time.time()`), which is not monotonic.
 * Heartbeats are explicit calls from the executor; a blocking call inside a step cannot
   renew its own lease.
-* Graceful release consumes an attempt, because the attempt counter *is* the fencing token.
-  Repeated restarts of a long task could therefore exhaust `max_attempts`.
+* `attempt` counts every claim because it *is* the fencing token. A graceful release (worker
+  shutdown) therefore advances the token but deliberately does **not** consume retry budget:
+  `max_attempts` caps failed or lost attempts (`attempts_used` = `attempt` - `releases`), and
+  the cap is enforced when a failure or lease expiry is recorded. The consequence is that a
+  task released over and over is never dead-lettered by the cap.
+* A checkpoint is accepted after the lease deadline as long as the token is still current (it
+  records finished work, like `complete`), while a heartbeat is rejected (it would extend
+  ownership). Once the task is reclaimed, the old token can do neither.
+* The outbox row bookkeeping is unconditional (no `status = 'pending'` guard), which is why two
+  dispatchers can double-send; see the non-guarantees.
 * A failed outbox delivery is retried forever with capped backoff; there is no
   dead-letter state for outbox rows.
-* `DedupSink` guarantees effectively-once only when the handler's effect and the dedup key
-  share a transaction. Against an external system it narrows duplicates but cannot eliminate
-  them.
+* `DedupSink` is effectively-once only in `transactional=True` mode, where the handler is
+  given the sink's SQLite connection and its effect (rows in the same database) commits or
+  rolls back together with the dedup key; a crash before commit leaves neither (tested). In
+  the default mode the handler's effect is outside the dedup transaction, so against an
+  external system a crash after the effect repeats it on redelivery (also tested). It narrows
+  duplicates there but cannot eliminate them.
+* A result that cannot be serialised to JSON fails the task permanently
+  (`ResultNotRecordable`) instead of retrying, so the executor's side effects are not re-run.
+  Other store errors while recording a result (a locked or full database) propagate out of the
+  worker and leave the task leased for the reaper, as if the process had died.
 * Payloads and results are stored as JSON text with no size limits or schema validation.
 * The audit log is append-only against ordinary statements; anyone with write access to the
   file can drop the triggers, and there is no hash chain, so it is neither tamper-proof nor

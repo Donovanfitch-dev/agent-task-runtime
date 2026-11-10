@@ -21,6 +21,8 @@ class TaskContext:
         self.task = task
         self.worker_id = worker_id
         self.fencing_token = task.fencing_token
+        #: The duration this claim's lease was granted for; heartbeats renew with it.
+        self.lease_seconds = task.lease_seconds
         #: Checkpoints from earlier attempts (and this one, as they are saved).
         self.checkpoints: dict[str, Any] = store.load_checkpoints(task.id)
 
@@ -31,7 +33,7 @@ class TaskContext:
 
     def heartbeat(self) -> None:
         """Renew the lease. Raises ``StaleLeaseError`` / ``LeaseExpiredError`` if lost."""
-        self._store.heartbeat(self.task.id, self.fencing_token)
+        self._store.heartbeat(self.task.id, self.fencing_token, lease_seconds=self.lease_seconds)
 
     @property
     def stop_requested(self) -> bool:
@@ -113,8 +115,6 @@ class Worker:
         ctx = TaskContext(self.store, task, self.worker_id, self._stop)
         try:
             result = self.executor.execute(ctx)
-            final = self.store.complete(task.id, token, result)
-            return RunResult(task.id, "succeeded", final)
         except StaleLeaseError as exc:
             # We lost the lease while working. The new owner is responsible now.
             return RunResult(task.id, "lease_lost", None, str(exc))
@@ -129,6 +129,26 @@ class Worker:
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             return self._finish(task, lambda: self.store.fail(task.id, token, msg), msg)
+        return self._record_success(task, token, result)
+
+    def _record_success(self, task: Task, token: int, result: Any) -> RunResult:
+        """Store the result. Errors here are the runtime's, not the executor's.
+
+        A result that cannot be serialised is a permanent failure: retrying
+        would re-run the executor's side effects only to fail the same way.
+        Other store errors (for example a locked or full database) propagate and
+        the task is left leased for the reaper, as if the process had died.
+        """
+        try:
+            final = self.store.complete(task.id, token, result)
+        except StaleLeaseError as exc:
+            return RunResult(task.id, "lease_lost", None, str(exc))
+        except (TypeError, ValueError) as exc:
+            msg = f"ResultNotRecordable: {type(exc).__name__}: {exc}"
+            return self._finish(
+                task, lambda: self.store.fail(task.id, token, msg, retryable=False), msg
+            )
+        return RunResult(task.id, "succeeded", final)
 
     def _finish(self, task: Task, action: Callable[[], Task], error: str | None) -> RunResult:
         try:

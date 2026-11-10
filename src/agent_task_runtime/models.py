@@ -70,11 +70,24 @@ class Task:
     result: Any
     created_at: float
     updated_at: float
+    #: Duration of the current/last claim's lease, so renewals keep it.
+    lease_seconds: float | None = None
+    #: Graceful releases so far. They advance the token but not the retry budget.
+    releases: int = 0
 
     @property
     def fencing_token(self) -> int:
         """The token a worker must present; equal to the claim count."""
         return self.attempt
+
+    @property
+    def attempts_used(self) -> int:
+        """Retry budget consumed: claims that ended in failure or a lost lease.
+
+        ``attempt`` counts every claim (it is the fencing token); a graceful
+        release is a claim that did not use up the budget.
+        """
+        return self.attempt - self.releases
 
 
 @dataclass(frozen=True)
